@@ -894,6 +894,68 @@ async fn sign_verify_msg() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn receive_for_hash_respects_min_final_cltv_expiry_delta() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let config = random_config(true);
+	let chain_source = random_chain_source(&bitcoind, &electrsd);
+	let node = setup_node(&chain_source, config);
+
+	let description =
+		Bolt11InvoiceDescription::Direct(Description::new("min-final-cltv".to_string()).unwrap());
+	let custom_delta: u16 = 200;
+
+	// A custom delta is honored: the invoice demands at least what we asked for (ldk
+	// clamps up to its minimum and adds a small buffer, so the encoded value is >=).
+	let custom_invoice = node
+		.bolt11_payment()
+		.receive_for_hash(
+			100_000,
+			&description.clone().into(),
+			3600,
+			PaymentHash([1u8; 32]),
+			Some(custom_delta),
+		)
+		.unwrap();
+	assert!(custom_invoice.min_final_cltv_expiry_delta() >= u64::from(custom_delta));
+
+	// None falls back to the node default, which is well below the custom delta.
+	let default_invoice = node
+		.bolt11_payment()
+		.receive_for_hash(100_000, &description.into(), 3600, PaymentHash([2u8; 32]), None)
+		.unwrap();
+	assert!(default_invoice.min_final_cltv_expiry_delta() < u64::from(custom_delta));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn receive_variable_amount_for_hash_respects_min_final_cltv_expiry_delta() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let config = random_config(true);
+	let chain_source = random_chain_source(&bitcoind, &electrsd);
+	let node = setup_node(&chain_source, config);
+
+	let description =
+		Bolt11InvoiceDescription::Direct(Description::new("min-final-cltv".to_string()).unwrap());
+	let custom_delta: u16 = 200;
+
+	let custom_invoice = node
+		.bolt11_payment()
+		.receive_variable_amount_for_hash(
+			&description.clone().into(),
+			3600,
+			PaymentHash([3u8; 32]),
+			Some(custom_delta),
+		)
+		.unwrap();
+	assert!(custom_invoice.min_final_cltv_expiry_delta() >= u64::from(custom_delta));
+
+	let default_invoice = node
+		.bolt11_payment()
+		.receive_variable_amount_for_hash(&description.into(), 3600, PaymentHash([4u8; 32]), None)
+		.unwrap();
+	assert!(default_invoice.min_final_cltv_expiry_delta() < u64::from(custom_delta));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn connection_multi_listen() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let chain_source = random_chain_source(&bitcoind, &electrsd);

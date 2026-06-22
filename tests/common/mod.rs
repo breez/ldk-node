@@ -1220,6 +1220,7 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 			&invoice_description.clone().into(),
 			9217,
 			manual_payment_hash,
+			None,
 		)
 		.unwrap();
 	let manual_payment_id = node_a.bolt11_payment().send(&manual_invoice, None).unwrap();
@@ -1263,6 +1264,7 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 			&invoice_description.into(),
 			9217,
 			manual_fail_payment_hash,
+			None,
 		)
 		.unwrap();
 	let manual_fail_payment_id = node_a.bolt11_payment().send(&manual_fail_invoice, None).unwrap();
