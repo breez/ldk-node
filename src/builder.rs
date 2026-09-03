@@ -58,9 +58,9 @@ use crate::fee_estimator::OnchainFeeEstimator;
 use crate::gossip::GossipSource;
 use crate::io::sqlite_store::SqliteStore;
 use crate::io::utils::{
-	open_or_migrate_fs_store, read_all_objects, read_event_queue,
-	read_external_pathfinding_scores_from_cache, read_network_graph, read_node_metrics,
-	read_output_sweeper, read_peer_info, read_scorer,
+	dedupe_payments_by_key, migrate_payment_store, open_or_migrate_fs_store, read_all_objects,
+	read_event_queue, read_external_pathfinding_scores_from_cache, read_network_graph,
+	read_node_metrics, read_output_sweeper, read_peer_info, read_scorer,
 };
 use crate::io::vss_store::VssStoreBuilder;
 use crate::io::{
@@ -1393,6 +1393,19 @@ fn build_with_store_internal(
 	let tx_broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
 	let fee_estimator = Arc::new(OnchainFeeEstimator::new());
 
+	// Bring the payment store to the current schema before it is read back, so a
+	// legacy entry and its migrated copy never both load. A no-op once migrated.
+	{
+		let kv_store_ref = Arc::clone(&kv_store);
+		let logger_ref = Arc::clone(&logger);
+		if let Err(e) =
+			runtime.block_on(async move { migrate_payment_store(&*kv_store_ref, logger_ref).await })
+		{
+			log_error!(logger, "Failed to migrate payment store keys: {}", e);
+			return Err(BuildError::ReadFailed);
+		}
+	}
+
 	let kv_store_ref = Arc::clone(&kv_store);
 	let logger_ref = Arc::clone(&logger);
 	let (payment_store_res, node_metris_res, pending_payment_store_res) =
@@ -1428,8 +1441,10 @@ fn build_with_store_internal(
 	};
 
 	let payment_store = match payment_store_res {
+		// A migration interrupted between its write and its remove leaves one payment
+		// under two keys; keep the newer copy rather than letting read order decide.
 		Ok(payments) => Arc::new(PaymentStore::new(
-			payments,
+			dedupe_payments_by_key(payments),
 			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
 			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
 			Arc::clone(&kv_store),

@@ -29,6 +29,14 @@ pub(crate) const PEER_INFO_PERSISTENCE_KEY: &str = "peers";
 pub(crate) const PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE: &str = "payments";
 pub(crate) const PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE: &str = "";
 
+/// The payment store's schema version will be persisted under this key.
+///
+/// Deliberately outside the payment namespace, so it is never returned by a list
+/// of the payments themselves.
+pub(crate) const PAYMENT_STORE_SCHEMA_PRIMARY_NAMESPACE: &str = "";
+pub(crate) const PAYMENT_STORE_SCHEMA_SECONDARY_NAMESPACE: &str = "";
+pub(crate) const PAYMENT_STORE_SCHEMA_KEY: &str = "payment_store_schema_version";
+
 /// The node metrics will be persisted under this key.
 pub(crate) const NODE_METRICS_PRIMARY_NAMESPACE: &str = "";
 pub(crate) const NODE_METRICS_SECONDARY_NAMESPACE: &str = "";

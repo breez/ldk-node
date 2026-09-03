@@ -5,6 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
+use std::collections::{hash_map, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::ops::Deref;
@@ -41,11 +42,15 @@ use lightning_types::string::PrintableString;
 use super::*;
 use crate::chain::ChainSource;
 use crate::config::WALLET_KEYS_SEED_LEN;
+use crate::data_store::{StorableObject, StorableObjectId};
 use crate::fee_estimator::OnchainFeeEstimator;
 use crate::io::{
 	NODE_METRICS_KEY, NODE_METRICS_PRIMARY_NAMESPACE, NODE_METRICS_SECONDARY_NAMESPACE,
+	PAYMENT_STORE_SCHEMA_KEY, PAYMENT_STORE_SCHEMA_PRIMARY_NAMESPACE,
+	PAYMENT_STORE_SCHEMA_SECONDARY_NAMESPACE,
 };
-use crate::logger::{log_error, LdkLogger, Logger};
+use crate::logger::{log_error, log_info, LdkLogger, Logger};
+use crate::payment::store::{PaymentDetails, PaymentKey};
 use crate::peer_store::PeerStore;
 use crate::types::{Broadcaster, DynStore, KeysManager, Sweeper};
 use crate::wallet::ser::{ChangeSetDeserWrapper, ChangeSetSerWrapper};
@@ -899,5 +904,330 @@ mod tests {
 		.await
 		.unwrap();
 		v1_store
+	}
+}
+
+/// The payment store layout this build writes: payments keyed by id *and* direction.
+pub(crate) const PAYMENT_STORE_SCHEMA_VERSION: u16 = 1;
+
+/// The layout of a store written before payment keys carried the direction. Also the
+/// version reported for a store that has no schema record at all.
+const PAYMENT_STORE_SCHEMA_VERSION_LEGACY: u16 = 0;
+
+/// Reads the payment store's schema version, treating a store with no record as
+/// [`PAYMENT_STORE_SCHEMA_VERSION_LEGACY`].
+pub(crate) async fn read_payment_store_schema_version(
+	kv_store: &DynStore,
+) -> Result<u16, std::io::Error> {
+	let read_res: Result<Vec<u8>, std::io::Error> = KVStore::read(
+		&*kv_store,
+		PAYMENT_STORE_SCHEMA_PRIMARY_NAMESPACE,
+		PAYMENT_STORE_SCHEMA_SECONDARY_NAMESPACE,
+		PAYMENT_STORE_SCHEMA_KEY,
+	)
+	.await
+	.map_err(|e| e.into());
+
+	match read_res {
+		Ok(bytes) => {
+			let raw: [u8; 2] = bytes.as_slice().try_into().map_err(|_| {
+				std::io::Error::new(
+					std::io::ErrorKind::InvalidData,
+					"Payment store schema version is malformed",
+				)
+			})?;
+			Ok(u16::from_be_bytes(raw))
+		},
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+			Ok(PAYMENT_STORE_SCHEMA_VERSION_LEGACY)
+		},
+		Err(e) => Err(e),
+	}
+}
+
+async fn write_payment_store_schema_version(
+	kv_store: &DynStore, version: u16,
+) -> Result<(), std::io::Error> {
+	KVStore::write(
+		&*kv_store,
+		PAYMENT_STORE_SCHEMA_PRIMARY_NAMESPACE,
+		PAYMENT_STORE_SCHEMA_SECONDARY_NAMESPACE,
+		PAYMENT_STORE_SCHEMA_KEY,
+		version.to_be_bytes().to_vec(),
+	)
+	.await?;
+	Ok(())
+}
+
+/// Brings the payment store up to [`PAYMENT_STORE_SCHEMA_VERSION`], doing nothing if
+/// it is already there.
+///
+/// The version record is written only once every payment has been moved, so this
+/// does no work on any startup after the one that migrates. `KVStore` has no
+/// cross-key transaction, so an interrupted run is handled by convergence instead:
+/// the version stays behind, the next startup repeats the move, and each step is
+/// individually safe to redo.
+pub(crate) async fn migrate_payment_store<L: Deref>(
+	kv_store: &DynStore, logger: L,
+) -> Result<(), std::io::Error>
+where
+	L::Target: LdkLogger,
+{
+	if read_payment_store_schema_version(kv_store).await? >= PAYMENT_STORE_SCHEMA_VERSION {
+		return Ok(());
+	}
+
+	migrate_payment_store_keys(kv_store, logger).await?;
+	write_payment_store_schema_version(kv_store, PAYMENT_STORE_SCHEMA_VERSION).await
+}
+
+/// Moves payments persisted under the pre-`(id, direction)` key format to their
+/// current key.
+///
+/// Payments used to be stored under the hex payment id alone. Both sides of a
+/// payment to ourselves share that id, so the key now carries the direction too. A
+/// legacy entry still loads correctly (the direction is part of the value), but the
+/// next write for it lands on the new key and leaves the old one behind holding
+/// stale data. Both are read on the following startup and collapse onto the same
+/// key, where the survivor is decided by read-completion order, so the stale copy
+/// can win.
+///
+/// Each legacy entry is written under its new key before the old one is removed, so
+/// an interrupted run leaves a duplicate rather than dropping a payment. Re-running
+/// is a no-op.
+pub(crate) async fn migrate_payment_store_keys<L: Deref>(
+	kv_store: &DynStore, logger: L,
+) -> Result<(), std::io::Error>
+where
+	L::Target: LdkLogger,
+{
+	let primary = PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE;
+	let secondary = PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE;
+
+	for key in KVStore::list(&*kv_store, primary, secondary).await? {
+		if is_directional_payment_key(&key) {
+			continue;
+		}
+
+		let bytes = KVStore::read(&*kv_store, primary, secondary, &key).await?;
+		let payment = PaymentDetails::read(&mut &*bytes).map_err(|e| {
+			log_error!(logger, "Failed to deserialize payment under legacy key {}: {}", key, e);
+			std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to deserialize payment")
+		})?;
+
+		let new_key = payment.id().encode_to_hex_str();
+		if new_key == key {
+			continue;
+		}
+
+		KVStore::write(&*kv_store, primary, secondary, &new_key, payment.encode()).await?;
+		KVStore::remove(&*kv_store, primary, secondary, &key, false).await?;
+		log_info!(logger, "Migrated payment {} to key {}", key, new_key);
+	}
+
+	Ok(())
+}
+
+/// Whether `key` already carries the direction suffix the payment key format uses.
+/// A legacy key is the bare hex id, and hex never contains `_`.
+fn is_directional_payment_key(key: &str) -> bool {
+	key.ends_with("_in") || key.ends_with("_out")
+}
+
+/// Collapses payments that share a key, keeping the most recently updated copy.
+///
+/// A run of [`migrate_payment_store_keys`] interrupted between the write and the
+/// remove leaves the same payment under both its legacy and its current key. Both
+/// are read back, and building the store's map from them would otherwise let
+/// read-completion order pick the winner.
+pub(crate) fn dedupe_payments_by_key(payments: Vec<PaymentDetails>) -> Vec<PaymentDetails> {
+	let mut by_key: HashMap<PaymentKey, PaymentDetails> = HashMap::new();
+	for payment in payments {
+		match by_key.entry(payment.id()) {
+			hash_map::Entry::Occupied(mut e) => {
+				if payment.latest_update_timestamp > e.get().latest_update_timestamp {
+					e.insert(payment);
+				}
+			},
+			hash_map::Entry::Vacant(e) => {
+				e.insert(payment);
+			},
+		}
+	}
+	by_key.into_values().collect()
+}
+
+#[cfg(test)]
+mod payment_key_migration_tests {
+	use lightning::ln::channelmanager::PaymentId;
+	use lightning::util::test_utils::TestLogger;
+	use lightning_types::payment::PaymentHash;
+
+	use super::*;
+	use crate::hex_utils;
+	use crate::io::test_utils::InMemoryStore;
+	use crate::payment::store::{PaymentDirection, PaymentKind, PaymentStatus};
+	use crate::types::DynStoreWrapper;
+
+	fn payment(id_byte: u8, direction: PaymentDirection, timestamp: u64) -> PaymentDetails {
+		let hash = PaymentHash([id_byte; 32]);
+		let mut details = PaymentDetails::new(
+			PaymentId(hash.0),
+			PaymentKind::Bolt11 {
+				hash,
+				preimage: None,
+				secret: None,
+				counterparty_skimmed_fee_msat: None,
+			},
+			Some(1_000),
+			None,
+			direction,
+			PaymentStatus::Pending,
+		);
+		details.latest_update_timestamp = timestamp;
+		details
+	}
+
+	async fn legacy_write(store: &DynStore, payment: &PaymentDetails) -> String {
+		let legacy_key = hex_utils::to_string(&payment.id.0);
+		KVStore::write(
+			store,
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+			&legacy_key,
+			payment.encode(),
+		)
+		.await
+		.unwrap();
+		legacy_key
+	}
+
+	async fn keys(store: &DynStore) -> Vec<String> {
+		let mut keys = KVStore::list(
+			store,
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+		)
+		.await
+		.unwrap();
+		keys.sort();
+		keys
+	}
+
+	#[tokio::test]
+	async fn legacy_key_is_moved_to_its_directional_key() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let logger = Arc::new(TestLogger::new());
+		let inbound = payment(1, PaymentDirection::Inbound, 10);
+		let legacy_key = legacy_write(&*store, &inbound).await;
+
+		migrate_payment_store_keys(&*store, Arc::clone(&logger)).await.unwrap();
+
+		assert_eq!(keys(&*store).await, vec![format!("{legacy_key}_in")]);
+	}
+
+	#[tokio::test]
+	async fn migration_is_idempotent() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let logger = Arc::new(TestLogger::new());
+		legacy_write(&*store, &payment(2, PaymentDirection::Outbound, 10)).await;
+
+		migrate_payment_store_keys(&*store, Arc::clone(&logger)).await.unwrap();
+		let after_first = keys(&*store).await;
+		migrate_payment_store_keys(&*store, Arc::clone(&logger)).await.unwrap();
+
+		assert_eq!(keys(&*store).await, after_first);
+	}
+
+	/// The reason the key had to change: both sides of a self-payment share an id, so
+	/// they must occupy separate keys rather than overwriting each other.
+	#[tokio::test]
+	async fn both_sides_of_one_id_survive() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let logger = Arc::new(TestLogger::new());
+		let inbound = payment(3, PaymentDirection::Inbound, 10);
+		let outbound = payment(3, PaymentDirection::Outbound, 11);
+		let hex = hex_utils::to_string(&inbound.id.0);
+
+		legacy_write(&*store, &inbound).await;
+		migrate_payment_store_keys(&*store, Arc::clone(&logger)).await.unwrap();
+		KVStore::write(
+			&*store,
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+			&outbound.id().encode_to_hex_str(),
+			outbound.encode(),
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(keys(&*store).await, vec![format!("{hex}_in"), format!("{hex}_out")]);
+	}
+
+	#[tokio::test]
+	async fn migration_records_the_schema_version() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let logger = Arc::new(TestLogger::new());
+		assert_eq!(read_payment_store_schema_version(&*store).await.unwrap(), 0);
+
+		migrate_payment_store(&*store, Arc::clone(&logger)).await.unwrap();
+
+		assert_eq!(
+			read_payment_store_schema_version(&*store).await.unwrap(),
+			PAYMENT_STORE_SCHEMA_VERSION
+		);
+	}
+
+	/// Once the version is recorded the migration must not touch the store again, so a
+	/// legacy-shaped key written afterwards is left exactly where it is.
+	#[tokio::test]
+	async fn migration_does_not_run_again_once_recorded() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let logger = Arc::new(TestLogger::new());
+		migrate_payment_store(&*store, Arc::clone(&logger)).await.unwrap();
+
+		let legacy_key = legacy_write(&*store, &payment(5, PaymentDirection::Inbound, 10)).await;
+		migrate_payment_store(&*store, Arc::clone(&logger)).await.unwrap();
+
+		assert_eq!(keys(&*store).await, vec![legacy_key]);
+	}
+
+	/// An interrupted run leaves the version behind, so the next startup repeats the
+	/// move rather than skipping it.
+	#[tokio::test]
+	async fn interrupted_migration_is_repeated_on_the_next_startup() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let logger = Arc::new(TestLogger::new());
+		let legacy_key = legacy_write(&*store, &payment(6, PaymentDirection::Outbound, 10)).await;
+
+		// The move ran but the version write never landed.
+		migrate_payment_store_keys(&*store, Arc::clone(&logger)).await.unwrap();
+		legacy_write(&*store, &payment(6, PaymentDirection::Outbound, 10)).await;
+		assert_eq!(read_payment_store_schema_version(&*store).await.unwrap(), 0);
+
+		migrate_payment_store(&*store, Arc::clone(&logger)).await.unwrap();
+
+		assert_eq!(keys(&*store).await, vec![format!("{legacy_key}_out")]);
+		assert_eq!(
+			read_payment_store_schema_version(&*store).await.unwrap(),
+			PAYMENT_STORE_SCHEMA_VERSION
+		);
+	}
+
+	/// A migration interrupted between its write and its remove leaves the payment
+	/// under both keys, and the stale legacy copy must not win the next startup.
+	#[tokio::test]
+	async fn interrupted_migration_keeps_the_newer_copy() {
+		let stale = payment(4, PaymentDirection::Inbound, 10);
+		let fresh = payment(4, PaymentDirection::Inbound, 20);
+
+		let deduped = dedupe_payments_by_key(vec![fresh.clone(), stale.clone()]);
+		assert_eq!(deduped.len(), 1);
+		assert_eq!(deduped[0].latest_update_timestamp, 20);
+
+		// Order must not decide the winner.
+		let deduped = dedupe_payments_by_key(vec![stale, fresh]);
+		assert_eq!(deduped.len(), 1);
+		assert_eq!(deduped[0].latest_update_timestamp, 20);
 	}
 }
