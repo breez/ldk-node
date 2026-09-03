@@ -48,7 +48,7 @@ use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use crate::payment::asynchronous::static_invoice_store::StaticInvoiceStore;
 use crate::payment::store::{
-	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind, PaymentStatus,
+	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKey, PaymentKind, PaymentStatus,
 };
 use crate::payment::PaymentMetadata;
 use crate::runtime::Runtime;
@@ -589,7 +589,7 @@ where
 		let update = PaymentDetailsUpdate {
 			hash: Some(Some(*payment_hash)),
 			status: Some(PaymentStatus::Failed),
-			..PaymentDetailsUpdate::new(payment_id)
+			..PaymentDetailsUpdate::inbound(payment_id)
 		};
 		match self.payment_store.update(update).await {
 			Ok(_) => Ok(()),
@@ -724,29 +724,11 @@ where
 				..
 			} => {
 				let payment_id = PaymentId(payment_hash.0);
-				let payment_info = self.payment_store.get(&payment_id);
+				// Paying an invoice we issued ourselves is supported: the inbound and
+				// outbound sides are separate records, so a claimable payment for a hash
+				// we are also paying is expected rather than a state to refuse.
+				let payment_info = self.payment_store.get(&PaymentKey::inbound(payment_id));
 				if let Some(info) = payment_info.as_ref() {
-					if info.direction == PaymentDirection::Outbound {
-						log_info!(
-							self.logger,
-							"Refused inbound payment with ID {}: circular payments are unsupported.",
-							payment_id
-						);
-						self.channel_manager.fail_htlc_backwards(&payment_hash);
-
-						let update = PaymentDetailsUpdate {
-							status: Some(PaymentStatus::Failed),
-							..PaymentDetailsUpdate::new(payment_id)
-						};
-						match self.payment_store.update(update).await {
-							Ok(_) => return Ok(()),
-							Err(e) => {
-								log_error!(self.logger, "Failed to access payment store: {}", e);
-								return Err(ReplayEvent());
-							},
-						};
-					}
-
 					if info.status == PaymentStatus::Succeeded
 						|| matches!(&info.kind, PaymentKind::Spontaneous { .. })
 					{
@@ -779,7 +761,7 @@ where
 
 						let update = PaymentDetailsUpdate {
 							status: Some(PaymentStatus::Failed),
-							..PaymentDetailsUpdate::new(payment_id)
+							..PaymentDetailsUpdate::inbound(payment_id)
 						};
 						match self.payment_store.update(update).await {
 							Ok(_) => return Ok(()),
@@ -830,7 +812,7 @@ where
 							PaymentKind::Bolt11 { .. } => {
 								let update = PaymentDetailsUpdate {
 									counterparty_skimmed_fee_msat: Some(Some(counterparty_skimmed_fee_msat)),
-									..PaymentDetailsUpdate::new(payment_id)
+									..PaymentDetailsUpdate::inbound(payment_id)
 								};
 								match self.payment_store.update(update).await {
 									Ok(_) => (),
@@ -1002,7 +984,7 @@ where
 					let update = PaymentDetailsUpdate {
 						hash: Some(Some(payment_hash)),
 						status: Some(PaymentStatus::Failed),
-						..PaymentDetailsUpdate::new(payment_id)
+						..PaymentDetailsUpdate::inbound(payment_id)
 					};
 					match self.payment_store.update(update).await {
 						Ok(_) => return Ok(()),
@@ -1042,7 +1024,7 @@ where
 						secret: Some(Some(payment_secret)),
 						amount_msat: Some(Some(amount_msat)),
 						status: Some(PaymentStatus::Succeeded),
-						..PaymentDetailsUpdate::new(payment_id)
+						..PaymentDetailsUpdate::inbound(payment_id)
 					},
 					PaymentPurpose::Bolt12OfferPayment {
 						payment_preimage, payment_secret, ..
@@ -1051,7 +1033,7 @@ where
 						secret: Some(Some(payment_secret)),
 						amount_msat: Some(Some(amount_msat)),
 						status: Some(PaymentStatus::Succeeded),
-						..PaymentDetailsUpdate::new(payment_id)
+						..PaymentDetailsUpdate::inbound(payment_id)
 					},
 					PaymentPurpose::Bolt12RefundPayment {
 						payment_preimage,
@@ -1062,13 +1044,13 @@ where
 						secret: Some(Some(payment_secret)),
 						amount_msat: Some(Some(amount_msat)),
 						status: Some(PaymentStatus::Succeeded),
-						..PaymentDetailsUpdate::new(payment_id)
+						..PaymentDetailsUpdate::inbound(payment_id)
 					},
 					PaymentPurpose::SpontaneousPayment(preimage) => PaymentDetailsUpdate {
 						preimage: Some(Some(preimage)),
 						amount_msat: Some(Some(amount_msat)),
 						status: Some(PaymentStatus::Succeeded),
-						..PaymentDetailsUpdate::new(payment_id)
+						..PaymentDetailsUpdate::inbound(payment_id)
 					},
 				};
 
@@ -1131,7 +1113,7 @@ where
 					preimage: Some(Some(payment_preimage)),
 					fee_paid_msat: Some(fee_paid_msat),
 					status: Some(PaymentStatus::Succeeded),
-					..PaymentDetailsUpdate::new(payment_id)
+					..PaymentDetailsUpdate::outbound(payment_id)
 				};
 
 				match self.payment_store.update(update).await {
@@ -1142,7 +1124,7 @@ where
 					},
 				};
 
-				self.payment_store.get(&payment_id).map(|payment| {
+				self.payment_store.get(&PaymentKey::outbound(payment_id)).map(|payment| {
 					let amount_msat = payment.amount_msat.expect(
 						"outbound payments should record their amount before they can succeed",
 					);
@@ -1187,7 +1169,7 @@ where
 				let update = PaymentDetailsUpdate {
 					hash: Some(payment_hash),
 					status: Some(PaymentStatus::Failed),
-					..PaymentDetailsUpdate::new(payment_id)
+					..PaymentDetailsUpdate::outbound(payment_id)
 				};
 				match self.payment_store.update(update).await {
 					Ok(_) => {},

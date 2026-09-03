@@ -113,7 +113,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(cycle_tests)]
 use std::{any::Any, sync::Weak};
 
-use crate::ffi::maybe_wrap;
 pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
 pub use bip39;
 pub use bitcoin;
@@ -168,9 +167,10 @@ use lnurl_auth::LnurlAuth;
 use logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use payment::asynchronous::static_invoice_store::StaticInvoiceStore;
+use payment::store::PaymentKey;
 use payment::{
-	Bolt11Payment, Bolt12Payment, OnchainPayment, PaymentDetails, SpontaneousPayment,
-	UnifiedPayment,
+	Bolt11Payment, Bolt12Payment, OnchainPayment, PaymentDetails, PaymentDirection,
+	SpontaneousPayment, UnifiedPayment,
 };
 use peer_store::{PeerInfo, PeerStore};
 use runtime::Runtime;
@@ -183,6 +183,7 @@ use types::{
 pub use types::{ChannelDetails, CustomTlvRecord, PeerDetails, UserChannelId};
 pub use vss_client;
 
+use crate::ffi::maybe_wrap;
 use crate::scoring::setup_background_pathfinding_scores_sync;
 use crate::wallet::FundingAmount;
 
@@ -1898,13 +1899,32 @@ impl Node {
 	/// Retrieve the details of a specific payment with the given id.
 	///
 	/// Returns `Some` if the payment was known and `None` otherwise.
+	///
+	/// An id can name both an inbound and an outbound payment when we paid an
+	/// invoice we issued ourselves. The outbound side is returned in that case;
+	/// use [`Self::payment_directed`] to ask for one side specifically.
 	pub fn payment(&self, payment_id: &PaymentId) -> Option<PaymentDetails> {
-		self.payment_store.get(payment_id)
+		self.payment_directed(payment_id, PaymentDirection::Outbound)
+			.or_else(|| self.payment_directed(payment_id, PaymentDirection::Inbound))
+	}
+
+	/// Retrieve one side of a payment with the given id.
+	///
+	/// Returns `Some` if that side was known and `None` otherwise.
+	pub fn payment_directed(
+		&self, payment_id: &PaymentId, direction: PaymentDirection,
+	) -> Option<PaymentDetails> {
+		self.payment_store.get(&PaymentKey { id: *payment_id, direction })
 	}
 
 	/// Remove the payment with the given id from the store.
+	///
+	/// Removes both sides when the id names a payment we made to ourselves.
 	pub fn remove_payment(&self, payment_id: &PaymentId) -> Result<(), Error> {
-		self.runtime.block_on(self.payment_store.remove(&payment_id))
+		self.runtime.block_on(async {
+			self.payment_store.remove(&PaymentKey::outbound(*payment_id)).await?;
+			self.payment_store.remove(&PaymentKey::inbound(*payment_id)).await
+		})
 	}
 
 	/// Retrieves an overview of all known balances.

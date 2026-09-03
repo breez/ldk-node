@@ -54,7 +54,7 @@ use persist::KVStoreWalletPersister;
 use crate::config::Config;
 use crate::fee_estimator::{ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
 use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
-use crate::payment::store::ConfirmationStatus;
+use crate::payment::store::{ConfirmationStatus, PaymentKey};
 use crate::payment::{
 	PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus, PendingPaymentDetails,
 };
@@ -400,12 +400,14 @@ impl Wallet {
 					// the payment store with the replacement txid before the next sync cycle, so we
 					// can safely fetch it here.
 					debug_assert!(
-						self.payment_store.get(&payment_id).is_some(),
+						self.payment_store.get(&PaymentKey::outbound(payment_id)).is_some(),
 						"Payment {:?} expected in store during WalletEvent::TxReplaced but not found",
 						payment_id,
 					);
-					let payment =
-						self.payment_store.get(&payment_id).ok_or(Error::InvalidPaymentId)?;
+					let payment = self
+						.payment_store
+						.get(&PaymentKey::outbound(payment_id))
+						.ok_or(Error::InvalidPaymentId)?;
 					let pending_payment_details =
 						self.create_pending_payment_from_tx(payment, conflict_txids.clone());
 
@@ -1240,10 +1242,11 @@ impl Wallet {
 	pub(crate) fn bump_fee_rbf(
 		&self, payment_id: PaymentId, fee_rate: Option<FeeRate>,
 	) -> Result<Txid, Error> {
-		let payment = self.payment_store.get(&payment_id).ok_or_else(|| {
-			log_error!(self.logger, "Payment {} not found in payment store", payment_id);
-			Error::InvalidPaymentId
-		})?;
+		let payment =
+			self.payment_store.get(&PaymentKey::outbound(payment_id)).ok_or_else(|| {
+				log_error!(self.logger, "Payment {} not found in payment store", payment_id);
+				Error::InvalidPaymentId
+			})?;
 
 		if let PaymentKind::Onchain { status, .. } = &payment.kind {
 			match status {

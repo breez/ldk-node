@@ -21,7 +21,9 @@ use lightning_types::payment::{PaymentHash, PaymentPreimage};
 use crate::config::{Config, LDK_PAYMENT_RETRY_TIMEOUT};
 use crate::error::Error;
 use crate::logger::{log_error, log_info, LdkLogger, Logger};
-use crate::payment::store::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
+use crate::payment::store::{
+	PaymentDetails, PaymentDirection, PaymentKey, PaymentKind, PaymentStatus,
+};
 use crate::runtime::Runtime;
 use crate::types::{ChannelManager, CustomTlvRecord, KeysManager, PaymentStore};
 
@@ -68,7 +70,7 @@ impl SpontaneousPayment {
 		let payment_hash = PaymentHash::from(payment_preimage);
 		let payment_id = PaymentId(payment_hash.0);
 
-		if let Some(payment) = self.payment_store.get(&payment_id) {
+		if let Some(payment) = self.payment_store.get(&PaymentKey::outbound(payment_id)) {
 			if payment.status == PaymentStatus::Pending
 				|| payment.status == PaymentStatus::Succeeded
 			{

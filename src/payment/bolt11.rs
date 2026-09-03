@@ -32,8 +32,8 @@ use crate::ffi::{maybe_deref, maybe_try_convert_enum, maybe_wrap};
 use crate::liquidity::LiquiditySource;
 use crate::logger::{log_error, log_info, LdkLogger, Logger};
 use crate::payment::store::{
-	LSPS2Parameters, PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind,
-	PaymentStatus,
+	LSPS2Parameters, PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKey,
+	PaymentKind, PaymentStatus,
 };
 use crate::peer_store::{PeerInfo, PeerStore};
 use crate::runtime::Runtime;
@@ -297,7 +297,7 @@ impl Bolt11Payment {
 		let invoice = maybe_deref(invoice);
 		let payment_hash = invoice.payment_hash();
 		let payment_id = PaymentId(invoice.payment_hash().0);
-		if let Some(payment) = self.payment_store.get(&payment_id) {
+		if let Some(payment) = self.payment_store.get(&PaymentKey::outbound(payment_id)) {
 			if payment.status == PaymentStatus::Pending
 				|| payment.status == PaymentStatus::Succeeded
 			{
@@ -410,7 +410,7 @@ impl Bolt11Payment {
 
 		let payment_hash = invoice.payment_hash();
 		let payment_id = PaymentId(invoice.payment_hash().0);
-		if let Some(payment) = self.payment_store.get(&payment_id) {
+		if let Some(payment) = self.payment_store.get(&PaymentKey::outbound(payment_id)) {
 			if payment.status == PaymentStatus::Pending
 				|| payment.status == PaymentStatus::Succeeded
 			{
@@ -530,7 +530,7 @@ impl Bolt11Payment {
 			return Err(Error::InvalidPaymentPreimage);
 		}
 
-		if let Some(details) = self.payment_store.get(&payment_id) {
+		if let Some(details) = self.payment_store.get(&PaymentKey::inbound(payment_id)) {
 			// For payments requested via `receive*_via_jit_channel_for_hash()`
 			// `skimmed_fee_msat` held by LSP must be taken into account.
 			let skimmed_fee_msat = match details.kind {
@@ -581,7 +581,7 @@ impl Bolt11Payment {
 
 		let update = PaymentDetailsUpdate {
 			status: Some(PaymentStatus::Failed),
-			..PaymentDetailsUpdate::new(payment_id)
+			..PaymentDetailsUpdate::inbound(payment_id)
 		};
 
 		match self.runtime.block_on(self.payment_store.update(update)) {

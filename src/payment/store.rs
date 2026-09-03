@@ -150,12 +150,43 @@ impl StorableObjectId for PaymentId {
 		hex_utils::to_string(&self.0)
 	}
 }
+/// Identifies a stored payment.
+///
+/// One node can hold both sides of a single payment hash at the same time: paying
+/// an invoice it issued itself leaves an inbound and an outbound record that share
+/// an id. They are separate payments, so the direction is part of the identity.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PaymentKey {
+	pub id: PaymentId,
+	pub direction: PaymentDirection,
+}
+
+impl PaymentKey {
+	pub fn inbound(id: PaymentId) -> Self {
+		Self { id, direction: PaymentDirection::Inbound }
+	}
+
+	pub fn outbound(id: PaymentId) -> Self {
+		Self { id, direction: PaymentDirection::Outbound }
+	}
+}
+
+impl StorableObjectId for PaymentKey {
+	fn encode_to_hex_str(&self) -> String {
+		let direction = match self.direction {
+			PaymentDirection::Inbound => "in",
+			PaymentDirection::Outbound => "out",
+		};
+		format!("{}_{}", hex_utils::to_string(&self.id.0), direction)
+	}
+}
+
 impl StorableObject for PaymentDetails {
-	type Id = PaymentId;
+	type Id = PaymentKey;
 	type Update = PaymentDetailsUpdate;
 
 	fn id(&self) -> Self::Id {
-		self.id
+		PaymentKey { id: self.id, direction: self.direction }
 	}
 
 	fn update(&mut self, update: Self::Update) -> bool {
@@ -298,7 +329,7 @@ impl StorableObject for PaymentDetails {
 }
 
 /// Represents the direction of a payment.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum PaymentDirection {
 	/// The payment is inbound.
@@ -518,14 +549,16 @@ pub(crate) struct PaymentDetailsUpdate {
 	pub amount_msat: Option<Option<u64>>,
 	pub fee_paid_msat: Option<Option<u64>>,
 	pub counterparty_skimmed_fee_msat: Option<Option<u64>>,
-	pub direction: Option<PaymentDirection>,
+	/// Part of the identity of the record being updated, not a mutable field: it
+	/// selects the inbound or outbound side of `id`.
+	pub direction: PaymentDirection,
 	pub status: Option<PaymentStatus>,
 	pub confirmation_status: Option<ConfirmationStatus>,
 	pub txid: Option<Txid>,
 }
 
 impl PaymentDetailsUpdate {
-	pub fn new(id: PaymentId) -> Self {
+	pub fn new(id: PaymentId, direction: PaymentDirection) -> Self {
 		Self {
 			id,
 			hash: None,
@@ -534,11 +567,19 @@ impl PaymentDetailsUpdate {
 			amount_msat: None,
 			fee_paid_msat: None,
 			counterparty_skimmed_fee_msat: None,
-			direction: None,
+			direction,
 			status: None,
 			confirmation_status: None,
 			txid: None,
 		}
+	}
+
+	pub fn inbound(id: PaymentId) -> Self {
+		Self::new(id, PaymentDirection::Inbound)
+	}
+
+	pub fn outbound(id: PaymentId) -> Self {
+		Self::new(id, PaymentDirection::Outbound)
 	}
 }
 
@@ -572,7 +613,7 @@ impl From<&PaymentDetails> for PaymentDetailsUpdate {
 			amount_msat: Some(value.amount_msat),
 			fee_paid_msat: Some(value.fee_paid_msat),
 			counterparty_skimmed_fee_msat,
-			direction: Some(value.direction),
+			direction: value.direction,
 			status: Some(value.status),
 			confirmation_status,
 			txid,
@@ -582,7 +623,7 @@ impl From<&PaymentDetails> for PaymentDetailsUpdate {
 
 impl StorableObjectUpdate<PaymentDetails> for PaymentDetailsUpdate {
 	fn id(&self) -> <PaymentDetails as StorableObject>::Id {
-		self.id
+		PaymentKey { id: self.id, direction: self.direction }
 	}
 }
 
