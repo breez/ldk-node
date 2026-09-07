@@ -127,7 +127,13 @@ impl Readable for PaymentDetails {
 			let hash = PaymentHash(id.0);
 
 			if secret.is_some() {
-				PaymentKind::Bolt11 { hash, preimage, secret, counterparty_skimmed_fee_msat: None }
+				PaymentKind::Bolt11 {
+					hash,
+					preimage,
+					secret,
+					counterparty_skimmed_fee_msat: None,
+					claim_deadline: None,
+				}
 			} else {
 				PaymentKind::Spontaneous { hash, preimage }
 			}
@@ -279,6 +285,18 @@ impl StorableObject for PaymentDetails {
 			update_if_necessary!(self.fee_paid_msat, fee_paid_msat_opt);
 		}
 
+		if let Some(deadline) = update.claim_deadline {
+			match self.kind {
+				PaymentKind::Bolt11 { ref mut claim_deadline, .. } => {
+					update_if_necessary!(*claim_deadline, deadline);
+				},
+				_ => debug_assert!(
+					false,
+					"We should only ever override claim_deadline for BOLT11 payments"
+				),
+			}
+		}
+
 		if let Some(skimmed_fee_msat) = update.counterparty_skimmed_fee_msat {
 			match self.kind {
 				PaymentKind::Bolt11 { ref mut counterparty_skimmed_fee_msat, .. } => {
@@ -395,6 +413,14 @@ pub enum PaymentKind {
 		///
 		/// [bLIP-52 / LSPS 2]: https://github.com/lightning/blips/blob/master/blip-0052.md
 		counterparty_skimmed_fee_msat: Option<u64>,
+		/// The block height by which this payment had to be claimed before it would
+		/// be failed back, as reported when it became claimable.
+		///
+		/// Set for an inbound payment that was held, which is the only case with a
+		/// deadline to meet, and kept afterwards as the record of what it was. The
+		/// deadline is not derivable from anything else stored here, so a node that
+		/// restarts while a payment is held can only learn it from this.
+		claim_deadline: Option<u32>,
 	},
 	/// A [BOLT 12] 'offer' payment, i.e., a payment for an [`Offer`].
 	///
@@ -460,12 +486,14 @@ impl_writeable_tlv_based_enum!(PaymentKind,
 		(0, hash, required),
 		(1, counterparty_skimmed_fee_msat, option),
 		(2, preimage, option),
+		(3, claim_deadline, option),
 		(4, secret, option),
 	},
 	(4, Bolt11) => {
 		(0, hash, required),
 		(1, counterparty_skimmed_fee_msat, option),
 		(2, preimage, option),
+		(3, claim_deadline, option),
 		(4, secret, option),
 		(6, _legacy_lsps2_parameters, (legacy, LSPS2Parameters,
 			|_| Ok(()),
@@ -549,6 +577,7 @@ pub(crate) struct PaymentDetailsUpdate {
 	pub amount_msat: Option<Option<u64>>,
 	pub fee_paid_msat: Option<Option<u64>>,
 	pub counterparty_skimmed_fee_msat: Option<Option<u64>>,
+	pub claim_deadline: Option<Option<u32>>,
 	/// Part of the identity of the record being updated, not a mutable field: it
 	/// selects the inbound or outbound side of `id`.
 	pub direction: PaymentDirection,
@@ -567,6 +596,7 @@ impl PaymentDetailsUpdate {
 			amount_msat: None,
 			fee_paid_msat: None,
 			counterparty_skimmed_fee_msat: None,
+			claim_deadline: None,
 			direction,
 			status: None,
 			confirmation_status: None,
@@ -605,6 +635,11 @@ impl From<&PaymentDetails> for PaymentDetailsUpdate {
 			_ => None,
 		};
 
+		let claim_deadline = match value.kind {
+			PaymentKind::Bolt11 { claim_deadline, .. } => Some(claim_deadline),
+			_ => None,
+		};
+
 		Self {
 			id: value.id,
 			hash: Some(hash),
@@ -613,6 +648,7 @@ impl From<&PaymentDetails> for PaymentDetailsUpdate {
 			amount_msat: Some(value.amount_msat),
 			fee_paid_msat: Some(value.fee_paid_msat),
 			counterparty_skimmed_fee_msat,
+			claim_deadline,
 			direction: value.direction,
 			status: Some(value.status),
 			confirmation_status,

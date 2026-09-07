@@ -773,6 +773,22 @@ where
 					}
 				}
 
+				// Recorded while the event carries it: the deadline is not derivable
+				// from anything else the store keeps, and a payment held for manual
+				// claim outlives a restart.
+				if let Some(info) = payment_info.as_ref() {
+					if matches!(info.kind, PaymentKind::Bolt11 { .. }) {
+						let update = PaymentDetailsUpdate {
+							claim_deadline: Some(claim_deadline),
+							..PaymentDetailsUpdate::inbound(payment_id)
+						};
+						if let Err(e) = self.payment_store.update(update).await {
+							log_error!(self.logger, "Failed to access payment store: {}", e);
+							return Err(ReplayEvent());
+						}
+					}
+				}
+
 				if counterparty_skimmed_fee_msat > 0 {
 					let max_total_opening_fee_msat = match &purpose {
 						PaymentPurpose::Bolt11InvoicePayment { .. } => onion_fields
