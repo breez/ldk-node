@@ -133,6 +133,7 @@ impl Readable for PaymentDetails {
 					secret,
 					counterparty_skimmed_fee_msat: None,
 					claim_deadline: None,
+					claimable_amount_msat: None,
 				}
 			} else {
 				PaymentKind::Spontaneous { hash, preimage }
@@ -297,6 +298,18 @@ impl StorableObject for PaymentDetails {
 			}
 		}
 
+		if let Some(amount) = update.claimable_amount_msat {
+			match self.kind {
+				PaymentKind::Bolt11 { ref mut claimable_amount_msat, .. } => {
+					update_if_necessary!(*claimable_amount_msat, amount);
+				},
+				_ => debug_assert!(
+					false,
+					"We should only ever override claimable_amount_msat for BOLT11 payments"
+				),
+			}
+		}
+
 		if let Some(skimmed_fee_msat) = update.counterparty_skimmed_fee_msat {
 			match self.kind {
 				PaymentKind::Bolt11 { ref mut counterparty_skimmed_fee_msat, .. } => {
@@ -421,6 +434,13 @@ pub enum PaymentKind {
 		/// deadline is not derivable from anything else stored here, so a node that
 		/// restarts while a payment is held can only learn it from this.
 		claim_deadline: Option<u32>,
+		/// The amount, in thousands of a satoshi, the payment carried when it last
+		/// became claimable.
+		///
+		/// Set for an inbound payment that was held. The amount is what the payer
+		/// sent, which an invoice that names no amount does not say, so a node that
+		/// restarts while such a payment is held can only learn it from this.
+		claimable_amount_msat: Option<u64>,
 	},
 	/// A [BOLT 12] 'offer' payment, i.e., a payment for an [`Offer`].
 	///
@@ -488,6 +508,7 @@ impl_writeable_tlv_based_enum!(PaymentKind,
 		(2, preimage, option),
 		(3, claim_deadline, option),
 		(4, secret, option),
+		(5, claimable_amount_msat, option),
 	},
 	(4, Bolt11) => {
 		(0, hash, required),
@@ -495,6 +516,7 @@ impl_writeable_tlv_based_enum!(PaymentKind,
 		(2, preimage, option),
 		(3, claim_deadline, option),
 		(4, secret, option),
+		(5, claimable_amount_msat, option),
 		(6, _legacy_lsps2_parameters, (legacy, LSPS2Parameters,
 			|_| Ok(()),
 			|_: &PaymentKind| None::<Option<LSPS2Parameters>>
@@ -578,6 +600,7 @@ pub(crate) struct PaymentDetailsUpdate {
 	pub fee_paid_msat: Option<Option<u64>>,
 	pub counterparty_skimmed_fee_msat: Option<Option<u64>>,
 	pub claim_deadline: Option<Option<u32>>,
+	pub claimable_amount_msat: Option<Option<u64>>,
 	/// Part of the identity of the record being updated, not a mutable field: it
 	/// selects the inbound or outbound side of `id`.
 	pub direction: PaymentDirection,
@@ -597,6 +620,7 @@ impl PaymentDetailsUpdate {
 			fee_paid_msat: None,
 			counterparty_skimmed_fee_msat: None,
 			claim_deadline: None,
+			claimable_amount_msat: None,
 			direction,
 			status: None,
 			confirmation_status: None,
@@ -635,9 +659,11 @@ impl From<&PaymentDetails> for PaymentDetailsUpdate {
 			_ => None,
 		};
 
-		let claim_deadline = match value.kind {
-			PaymentKind::Bolt11 { claim_deadline, .. } => Some(claim_deadline),
-			_ => None,
+		let (claim_deadline, claimable_amount_msat) = match value.kind {
+			PaymentKind::Bolt11 { claim_deadline, claimable_amount_msat, .. } => {
+				(Some(claim_deadline), Some(claimable_amount_msat))
+			},
+			_ => (None, None),
 		};
 
 		Self {
@@ -649,6 +675,7 @@ impl From<&PaymentDetails> for PaymentDetailsUpdate {
 			fee_paid_msat: Some(value.fee_paid_msat),
 			counterparty_skimmed_fee_msat,
 			claim_deadline,
+			claimable_amount_msat,
 			direction: value.direction,
 			status: Some(value.status),
 			confirmation_status,
@@ -726,11 +753,15 @@ mod tests {
 					preimage: p,
 					secret: s,
 					counterparty_skimmed_fee_msat: c,
+					claim_deadline: d,
+					claimable_amount_msat: a,
 				} => {
 					assert_eq!(hash, h);
 					assert_eq!(preimage, p);
 					assert_eq!(secret, s);
 					assert_eq!(None, c);
+					assert_eq!(None, d);
+					assert_eq!(None, a);
 				},
 				_ => {
 					panic!("Unexpected kind!");
@@ -824,11 +855,15 @@ mod tests {
 				preimage: p,
 				secret: s,
 				counterparty_skimmed_fee_msat: c,
+				claim_deadline: d,
+				claimable_amount_msat: a,
 			} => {
 				assert_eq!(hash, h);
 				assert_eq!(preimage, p);
 				assert_eq!(secret, s);
 				assert_eq!(counterparty_skimmed_fee_msat, c);
+				assert_eq!(None, d);
+				assert_eq!(None, a);
 			},
 			other => panic!("Expected Bolt11, got {:?}", other),
 		}
@@ -836,5 +871,40 @@ mod tests {
 		let reencoded = decoded.encode();
 		assert_eq!(reencoded[0], 2);
 		assert_eq!(decoded, PaymentKind::read(&mut &*reencoded).unwrap());
+	}
+
+	#[test]
+	fn a_held_payment_keeps_what_it_carried_when_it_became_claimable() {
+		let hash = PaymentHash([1; 32]);
+		let mut details = PaymentDetails::new(
+			PaymentId(hash.0),
+			PaymentKind::Bolt11 {
+				hash,
+				preimage: None,
+				secret: Some(PaymentSecret([2; 32])),
+				counterparty_skimmed_fee_msat: None,
+				claim_deadline: None,
+				claimable_amount_msat: None,
+			},
+			None,
+			None,
+			PaymentDirection::Inbound,
+			PaymentStatus::Pending,
+		);
+
+		assert!(details.update(PaymentDetailsUpdate {
+			claim_deadline: Some(Some(830_000)),
+			claimable_amount_msat: Some(Some(21_000)),
+			..PaymentDetailsUpdate::inbound(details.id)
+		}));
+
+		let decoded = PaymentDetails::read(&mut &*details.encode()).unwrap();
+		match decoded.kind {
+			PaymentKind::Bolt11 { claim_deadline, claimable_amount_msat, .. } => {
+				assert_eq!(claim_deadline, Some(830_000));
+				assert_eq!(claimable_amount_msat, Some(21_000));
+			},
+			other => panic!("Expected Bolt11, got {:?}", other),
+		}
 	}
 }

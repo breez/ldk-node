@@ -152,6 +152,7 @@ impl Bolt11Payment {
 			secret: Some(payment_secret.clone()),
 			counterparty_skimmed_fee_msat: None,
 			claim_deadline: None,
+			claimable_amount_msat: None,
 		};
 		let payment = PaymentDetails::new(
 			id,
@@ -234,6 +235,7 @@ impl Bolt11Payment {
 			secret: Some(payment_secret.clone()),
 			counterparty_skimmed_fee_msat: None,
 			claim_deadline: None,
+			claimable_amount_msat: None,
 		};
 		let payment = PaymentDetails::new(
 			id,
@@ -336,6 +338,7 @@ impl Bolt11Payment {
 					secret: payment_secret,
 					counterparty_skimmed_fee_msat: None,
 					claim_deadline: None,
+					claimable_amount_msat: None,
 				};
 				let payment = PaymentDetails::new(
 					payment_id,
@@ -367,6 +370,7 @@ impl Bolt11Payment {
 							secret: payment_secret,
 							counterparty_skimmed_fee_msat: None,
 							claim_deadline: None,
+							claimable_amount_msat: None,
 						};
 						let payment = PaymentDetails::new(
 							payment_id,
@@ -454,6 +458,7 @@ impl Bolt11Payment {
 					secret: payment_secret,
 					counterparty_skimmed_fee_msat: None,
 					claim_deadline: None,
+					claimable_amount_msat: None,
 				};
 
 				let payment = PaymentDetails::new(
@@ -486,6 +491,7 @@ impl Bolt11Payment {
 							secret: payment_secret,
 							counterparty_skimmed_fee_msat: None,
 							claim_deadline: None,
+							claimable_amount_msat: None,
 						};
 						let payment = PaymentDetails::new(
 							payment_id,

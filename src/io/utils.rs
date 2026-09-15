@@ -1078,6 +1078,8 @@ mod payment_key_migration_tests {
 				preimage: None,
 				secret: None,
 				counterparty_skimmed_fee_msat: None,
+				claim_deadline: None,
+				claimable_amount_msat: None,
 			},
 			Some(1_000),
 			None,

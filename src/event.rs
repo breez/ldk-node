@@ -773,13 +773,14 @@ where
 					}
 				}
 
-				// Recorded while the event carries it: the deadline is not derivable
-				// from anything else the store keeps, and a payment held for manual
-				// claim outlives a restart.
+				// Recorded while the event carries them: neither the deadline nor the
+				// amount is derivable from anything else the store keeps, and a
+				// payment held for manual claim outlives a restart.
 				if let Some(info) = payment_info.as_ref() {
 					if matches!(info.kind, PaymentKind::Bolt11 { .. }) {
 						let update = PaymentDetailsUpdate {
 							claim_deadline: Some(claim_deadline),
+							claimable_amount_msat: Some(Some(amount_msat)),
 							..PaymentDetailsUpdate::inbound(payment_id)
 						};
 						if let Err(e) = self.payment_store.update(update).await {
