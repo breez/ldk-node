@@ -1134,6 +1134,29 @@ where
 				};
 
 				match self.payment_store.update(update).await {
+					// Sent before its record was stored. A BOLT 12 payment has an invoice.
+					Ok(DataStoreUpdateResult::NotFound) if bolt12_invoice.is_none() => {
+						let kind = PaymentKind::Bolt11 {
+							hash: payment_hash,
+							preimage: Some(payment_preimage),
+							secret: None,
+							counterparty_skimmed_fee_msat: None,
+							claim_deadline: None,
+							claimable_amount_msat: None,
+						};
+						let payment = PaymentDetails::new(
+							payment_id,
+							kind,
+							None,
+							fee_paid_msat,
+							PaymentDirection::Outbound,
+							PaymentStatus::Succeeded,
+						);
+						if let Err(e) = self.payment_store.insert(payment).await {
+							log_error!(self.logger, "Failed to access payment store: {}", e);
+							return Err(ReplayEvent());
+						}
+					},
 					Ok(_) => {},
 					Err(e) => {
 						log_error!(self.logger, "Failed to access payment store: {}", e);
@@ -1142,14 +1165,11 @@ where
 				};
 
 				self.payment_store.get(&PaymentKey::outbound(payment_id)).map(|payment| {
-					let amount_msat = payment.amount_msat.expect(
-						"outbound payments should record their amount before they can succeed",
-					);
 					log_info!(
 						self.logger,
-						"Successfully sent payment of {}msat{} from \
+						"Successfully sent payment of {:?}msat{} from \
 						payment hash {:?} with preimage {:?}",
-						amount_msat,
+						payment.amount_msat,
 						if let Some(fee) = fee_paid_msat {
 							format!(" (fee {} msat)", fee)
 						} else {
@@ -1183,18 +1203,52 @@ where
 					reason
 				);
 
-				let update = PaymentDetailsUpdate {
-					hash: Some(payment_hash),
-					status: Some(PaymentStatus::Failed),
-					..PaymentDetailsUpdate::outbound(payment_id)
-				};
-				match self.payment_store.update(update).await {
-					Ok(_) => {},
-					Err(e) => {
-						log_error!(self.logger, "Failed to access payment store: {}", e);
-						return Err(ReplayEvent());
+				// LDK can report a payment failed after it reported it sent, which is to be
+				// ignored.
+				let stored = self.payment_store.get(&PaymentKey::outbound(payment_id));
+				if stored.as_ref().is_some_and(|payment| payment.status == PaymentStatus::Succeeded)
+				{
+					log_info!(
+						self.logger,
+						"Ignored the failure of payment {} that succeeded.",
+						payment_id
+					);
+					return Ok(());
+				}
+				let stored = match (stored, payment_hash) {
+					// Failed before its record was stored.
+					(None, Some(hash)) => {
+						let kind = PaymentKind::Bolt11 {
+							hash,
+							preimage: None,
+							secret: None,
+							counterparty_skimmed_fee_msat: None,
+							claim_deadline: None,
+							claimable_amount_msat: None,
+						};
+						let payment = PaymentDetails::new(
+							payment_id,
+							kind,
+							None,
+							None,
+							PaymentDirection::Outbound,
+							PaymentStatus::Failed,
+						);
+						self.payment_store.insert(payment).await.map(|_| ())
+					},
+					_ => {
+						let update = PaymentDetailsUpdate {
+							hash: Some(payment_hash),
+							status: Some(PaymentStatus::Failed),
+							..PaymentDetailsUpdate::outbound(payment_id)
+						};
+						self.payment_store.update(update).await.map(|_| ())
 					},
 				};
+				if let Err(e) = stored {
+					log_error!(self.logger, "Failed to access payment store: {}", e);
+					return Err(ReplayEvent());
+				}
 
 				let event =
 					Event::PaymentFailed { payment_id: Some(payment_id), payment_hash, reason };

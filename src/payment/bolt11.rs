@@ -15,7 +15,7 @@ use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use lightning::impl_writeable_tlv_based;
 use lightning::ln::channelmanager::{
-	Bolt11InvoiceParameters, OptionalBolt11PaymentParams, PaymentId,
+	Bolt11InvoiceParameters, OptionalBolt11PaymentParams, PaymentId, RecentPaymentDetails,
 };
 use lightning::ln::outbound_payment::{Bolt11PaymentError, Retry, RetryableSendFailure};
 use lightning::routing::router::{PaymentParameters, RouteParameters, RouteParametersConfig};
@@ -97,6 +97,19 @@ impl Bolt11Payment {
 			is_running,
 			logger,
 		}
+	}
+
+	/// Whether LDK tracks a payment with `payment_id`, which it does from the moment it
+	/// sends one until a while after the payment resolves. The payment store records a
+	/// payment only once it is sent, so a payment sent just before a crash can be
+	/// tracked by LDK alone.
+	fn is_tracked_by_ldk(&self, payment_id: PaymentId) -> bool {
+		self.channel_manager.list_recent_payments().iter().any(|payment| match payment {
+			RecentPaymentDetails::AwaitingInvoice { payment_id: id }
+			| RecentPaymentDetails::Pending { payment_id: id, .. }
+			| RecentPaymentDetails::Fulfilled { payment_id: id, .. }
+			| RecentPaymentDetails::Abandoned { payment_id: id, .. } => id == &payment_id,
+		})
 	}
 
 	pub(crate) fn receive_inner(
@@ -309,6 +322,10 @@ impl Bolt11Payment {
 				return Err(Error::DuplicatePayment);
 			}
 		}
+		if self.is_tracked_by_ldk(payment_id) {
+			log_error!(self.logger, "Payment error: an invoice must not be paid twice.");
+			return Err(Error::DuplicatePayment);
+		}
 
 		let route_params_config =
 			route_parameters.or(self.config.route_parameters).unwrap_or_default();
@@ -425,6 +442,10 @@ impl Bolt11Payment {
 				log_error!(self.logger, "Payment error: an invoice must not be paid twice.");
 				return Err(Error::DuplicatePayment);
 			}
+		}
+		if self.is_tracked_by_ldk(payment_id) {
+			log_error!(self.logger, "Payment error: an invoice must not be paid twice.");
+			return Err(Error::DuplicatePayment);
 		}
 
 		let route_params_config =
