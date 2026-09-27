@@ -145,7 +145,8 @@ impl<T: KVStore + Send + Sync> DynStoreTrait for DynStoreWrapper<T> {
 
 	fn list_async(
 		&self, primary_namespace: &str, secondary_namespace: &str,
-	) -> Pin<Box<dyn Future<Output = Result<Vec<String>, bitcoin::io::Error>> + Send + 'static>> {
+	) -> Pin<Box<dyn Future<Output = Result<Vec<String>, bitcoin::io::Error>> + Send + 'static>>
+	{
 		Box::pin(KVStore::list(&self.0, primary_namespace, secondary_namespace))
 	}
 }
